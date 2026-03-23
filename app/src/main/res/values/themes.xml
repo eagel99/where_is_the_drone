@@ -1,0 +1,5 @@
+<resources>
+    <style name="Theme.Where_is_the_drone" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">#000000</item>
+    </style>
+</resources>
