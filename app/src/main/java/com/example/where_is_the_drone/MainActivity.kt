@@ -44,6 +44,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -88,6 +89,13 @@ private const val DEFAULT_HFOV_DEG = 65f
 private const val LOCATION_INTERVAL_MS = 2000L
 private const val LOCATION_FASTEST_MS = 1000L
 private const val SMOOTH_ALPHA = 0.15f
+
+// Reticle: visible circle is the inner third of the 220.dp Canvas box.
+// 220 * 2/3 = 146.67 dp at scale 1.0.
+private const val RETICLE_BASE_DIAMETER_DP = 220.0 * 2.0 / 3.0
+private const val RETICLE_MIN_SCALE = 0.05f
+private const val RETICLE_MAX_SCALE = 1.5f
+private const val RETICLE_STEP = 1.15f
 
 class MainActivity : ComponentActivity(), SensorEventListener {
 
@@ -341,15 +349,33 @@ fun SkyPointApp(
         }
     }
 
-    // Reticle inscribed circle is 220.dp / 3 * 2  (see ReticleOverlay).
-    val reticleCircleDp = (220.0 * 2.0 / 3.0)
+    // Reticle scale is user-tunable so the operator can shrink/grow the circle to
+    // exactly fit the apparent target. 1.0 == base diameter (146.67 dp).
+    var reticleScale by rememberSaveable { mutableStateOf(1.0f) }
+    val reticleDiameterDp = RETICLE_BASE_DIAMETER_DP * reticleScale.toDouble()
     val screenWidthDp = LocalConfiguration.current.screenWidthDp.toDouble().coerceAtLeast(1.0)
 
-    val distance by remember(cameraHFov, selectedTarget) {
+    // Pinhole-camera (rectilinear) range estimate.
+    // focal_length_in_dp = (screen_half_width_dp) / tan(HFOV/2)
+    // distance = real_size * focal_dp / object_dp
+    // Equivalent to: distance = real_size / (2 * tan(angular_size / 2))
+    // but uses linear-in-tan(angle) pixel mapping that real lenses actually have,
+    // instead of the previous (and incorrect) linear-in-angle assumption.
+    val reticleAngularDeg by remember(cameraHFov, reticleScale, screenWidthDp) {
         derivedStateOf {
-            val angularDeg = (reticleCircleDp / screenWidthDp) * cameraHFov.toDouble()
-            val angularRad = Math.toRadians(angularDeg).coerceAtLeast(1e-6)
-            selectedTarget.size / (2.0 * tan(angularRad / 2.0))
+            val halfWidth = screenWidthDp / 2.0
+            val focalDp = halfWidth / tan(Math.toRadians(cameraHFov.toDouble() / 2.0))
+                .coerceAtLeast(1e-6)
+            val halfAngularRad = atan2(reticleDiameterDp / 2.0, focalDp)
+            Math.toDegrees(2.0 * halfAngularRad)
+        }
+    }
+    val distance by remember(cameraHFov, selectedTarget, reticleScale, screenWidthDp) {
+        derivedStateOf {
+            val halfWidth = screenWidthDp / 2.0
+            val focalDp = halfWidth / tan(Math.toRadians(cameraHFov.toDouble() / 2.0))
+                .coerceAtLeast(1e-6)
+            selectedTarget.size * focalDp / reticleDiameterDp.coerceAtLeast(1e-3)
         }
     }
 
@@ -398,7 +424,17 @@ fun SkyPointApp(
             }
 
             Spacer(modifier = Modifier.weight(1f))
-            ReticleOverlay()
+            ReticleArea(
+                circleDiameterDp = reticleDiameterDp.toFloat(),
+                scalePercent = (reticleScale * 100f).toInt(),
+                angularDeg = reticleAngularDeg.toFloat(),
+                onShrink = {
+                    reticleScale = (reticleScale / RETICLE_STEP).coerceAtLeast(RETICLE_MIN_SCALE)
+                },
+                onGrow = {
+                    reticleScale = (reticleScale * RETICLE_STEP).coerceAtMost(RETICLE_MAX_SCALE)
+                }
+            )
             Spacer(modifier = Modifier.weight(1f))
             BottomControls(
                 distance = distance,
@@ -704,16 +740,50 @@ fun TopInfoBar(
 }
 
 @Composable
-fun ReticleOverlay() {
+fun ReticleArea(
+    circleDiameterDp: Float,
+    scalePercent: Int,
+    angularDeg: Float,
+    onShrink: () -> Unit,
+    onGrow: () -> Unit
+) {
     Box(modifier = Modifier.fillMaxWidth().height(300.dp), contentAlignment = Alignment.Center) {
+        // Reticle: ticks fixed, target circle scales with the user-set scale.
         Canvas(modifier = Modifier.size(220.dp)) {
             val strokeWidth = 2.dp.toPx()
             val color = Color.Yellow.copy(alpha = 0.8f)
-            drawCircle(color = color, radius = size.minDimension / 3, style = Stroke(width = strokeWidth))
+            val reticleRadius = (circleDiameterDp.dp.toPx() / 2f)
+                .coerceAtLeast(2.dp.toPx())
+                .coerceAtMost(size.minDimension / 2f - 1f)
+            drawCircle(color = color, radius = reticleRadius, style = Stroke(width = strokeWidth))
             drawLine(color, start = center.copy(x = center.x - 35.dp.toPx()), end = center.copy(x = center.x - 5.dp.toPx()), strokeWidth = strokeWidth)
             drawLine(color, start = center.copy(x = center.x + 5.dp.toPx()), end = center.copy(x = center.x + 35.dp.toPx()), strokeWidth = strokeWidth)
             drawLine(color, start = center.copy(y = center.y - 35.dp.toPx()), end = center.copy(y = center.y - 5.dp.toPx()), strokeWidth = strokeWidth)
             drawLine(color, start = center.copy(y = center.y + 5.dp.toPx()), end = center.copy(y = center.y + 35.dp.toPx()), strokeWidth = strokeWidth)
+        }
+        // Scale controls + readout pinned to the left.
+        Column(
+            modifier = Modifier
+                .align(Alignment.CenterStart)
+                .padding(start = 8.dp)
+                .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(10.dp))
+                .padding(horizontal = 6.dp, vertical = 6.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            IconButton(
+                onClick = onGrow,
+                modifier = Modifier.size(32.dp)
+            ) {
+                Icon(Icons.Default.Add, contentDescription = "Grow reticle", tint = Color.Yellow)
+            }
+            Text("$scalePercent%", color = Color.Yellow, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+            Text("${"%.2f".format(angularDeg)}°", color = Color.LightGray, fontSize = 9.sp)
+            IconButton(
+                onClick = onShrink,
+                modifier = Modifier.size(32.dp)
+            ) {
+                Icon(Icons.Default.Remove, contentDescription = "Shrink reticle", tint = Color.Yellow)
+            }
         }
     }
 }
